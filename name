@@ -1,0 +1,72 @@
+package surfstore
+
+import (
+	context "context"
+	"fmt"
+	"sync"
+
+	emptypb "google.golang.org/protobuf/types/known/emptypb"
+)
+
+type MetaStore struct {
+	FileMetaMap    map[string]*FileMetaData
+	BlockStoreAddr string
+	UnimplementedMetaStoreServer
+	mu sync.Mutex
+}
+
+func (m *MetaStore) GetFileInfoMap(ctx context.Context, _ *emptypb.Empty) (*FileInfoMap, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	var serverFileInfoMap *FileInfoMap = new(FileInfoMap)
+	serverFileInfoMap.FileInfoMap = m.FileMetaMap
+	return serverFileInfoMap, nil
+}
+
+func (m *MetaStore) UpdateFile(ctx context.Context, fileMetaData *FileMetaData) (*Version, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	old, exist := m.FileMetaMap[fileMetaData.Filename]
+
+	if !exist {
+		m.FileMetaMap[fileMetaData.Filename] = fileMetaData
+		m.FileMetaMap[fileMetaData.Filename].Version = 1
+		return &Version{
+			Version: 1,
+		}, nil
+	}
+
+	if old.Version+1 == fileMetaData.Version {
+		m.FileMetaMap[fileMetaData.Filename] = fileMetaData
+	} else {
+		err := fmt.Errorf("wrong Version:%d, Lastest Version:%d",
+			fileMetaData.Version, old.Version)
+		ver0 := Version{
+			Version: -1,
+		}
+		return &ver0, err
+	}
+	ver := Version{
+		Version: fileMetaData.Version,
+	}
+	return &ver, nil
+}
+
+func (m *MetaStore) GetBlockStoreAddr(ctx context.Context, _ *emptypb.Empty) (*BlockStoreAddr, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	return &BlockStoreAddr{Addr: m.BlockStoreAddr}, nil
+}
+
+// This line guarantees all method for MetaStore are implemented
+var _ MetaStoreInterface = new(MetaStore)
+
+func NewMetaStore(blockStoreAddr string) *MetaStore {
+	return &MetaStore{
+		FileMetaMap:    map[string]*FileMetaData{},
+		BlockStoreAddr: blockStoreAddr,
+	}
+}
