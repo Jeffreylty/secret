@@ -1,66 +1,266 @@
 package surfstore
 
 import (
-	context "context"
-	"crypto/sha256"
-	"encoding/hex"
-	"fmt"
-	sync "sync"
+	"io"
+	"io/ioutil"
+	"log"
+	"os"
 )
 
-type BlockStore struct {
-	BlockMap map[string]*Block
-	UnimplementedBlockStoreServer
-	mu sync.Mutex
-}
+var realHash = make(map[string][]string)
+var bsAddr string
+var realData = make(map[string]*Block)
+var fileInfoMap = make(map[string]*FileMetaData)
 
-func (bs *BlockStore) GetBlock(ctx context.Context, blockHash *BlockHash) (*Block, error) {
-	bs.mu.Lock()
-	defer bs.mu.Unlock()
-	val, ok := bs.BlockMap[blockHash.Hash]
-	if ok {
-		return val, nil
+// Implement the logic for a client syncing with the server here.
+func ClientSync(client RPCClient) {
+	dir, e := ioutil.ReadDir(client.BaseDir)
+	if e != nil {
+		log.Println("Cannot read base dir: ", e)
 	}
-	return nil, fmt.Errorf("invalid Key: %s", blockHash.Hash)
-}
 
-func (bs *BlockStore) PutBlock(ctx context.Context, block *Block) (*Success, error) {
-	bs.mu.Lock()
-	defer bs.mu.Unlock()
-	hash := sha256.New()
-	hash.Write(block.BlockData)
-	hashBytes := hash.Sum(nil)
-	hashCode := hex.EncodeToString(hashBytes)
-	bs.BlockMap[hashCode] = block
-	return &Success{Flag: true}, nil
-}
+	if err := client.GetBlockStoreAddr(&bsAddr); err != nil {
+		log.Fatal(err)
+	}
 
-// Given a list of hashes “in”, returns a list containing the
-// subset of in that are stored in the key-value store
-func (bs *BlockStore) HasBlocks(ctx context.Context, blockHashesIn *BlockHashes) (*BlockHashes, error) {
-	bs.mu.Lock()
-	defer bs.mu.Unlock()
-	block_slice := make([]string, 0)
+	allList := make(map[string]bool)
 
-	for _, blockHash := range blockHashesIn.Hashes {
-		_, ok := bs.BlockMap[blockHash]
-		if ok {
-			block_slice = append(block_slice, blockHash)
+	nameMap := make(map[string]os.FileInfo)
+
+	//read the dir
+	for _, file := range dir {
+		nameMap[file.Name()] = file
+
+		if file.Name() == "index.txt" {
+			continue
+		}
+
+		fileContent, _ := os.Open(client.BaseDir + "/" + file.Name())
+
+		// if fi, _ := os.Stat(file.Name()); fi.Size() == 0 {
+		// 	blk := []byte("")
+		// 	h := sha256.Sum256(blk)
+		// 	hashCode := hex.EncodeToString(h[:])
+		// 	realHash[file.Name()] = append(realHash[file.Name()], hashCode)
+		// 	continue
+		// }
+
+		real := make([]byte, client.BlockSize)
+		for {
+			//read and encode every block
+			count, err := fileContent.Read(real)
+			if err == io.EOF {
+				//read until end of file
+				break
+			}
+			blk := real[:count]
+			hashCode := GetBlockHashString(blk)
+
+			block := new(Block)
+			block.BlockData = make([]byte, count)
+			copy(block.BlockData, blk)
+			block.BlockSize = int32(count)
+
+			realData[hashCode] = block
+			realHash[file.Name()] = append(realHash[file.Name()], hashCode)
+		}
+		allList[file.Name()] = true
+		fileContent.Close()
+	}
+
+	indexAddr := client.BaseDir + "/index.txt"
+	_, e = os.Stat(indexAddr)
+	if os.IsNotExist(e) {
+		file, _ := os.Create(indexAddr)
+		defer file.Close()
+	}
+
+	// indexFile, _ := ioutil.ReadFile(indexAddr)
+
+	//read the txt
+	// indexMap := make(map[string]int)
+	if fileInfoMap, e = LoadMetaFromMetaFile(client.BaseDir); e != nil {
+		log.Println("Cannot read index file: ", e)
+	}
+
+	var remoteInfo map[string]*FileMetaData
+	if e := client.GetFileInfoMap(&remoteInfo); e != nil {
+		log.Println("Cannot get remote file: ", e)
+	}
+
+	for fileName := range remoteInfo {
+		allList[fileName] = true
+	}
+
+	for fileName := range allList {
+		rHash, real := realHash[fileName]
+		txtMD, txt := fileInfoMap[fileName]
+		remoteMD, remote := remoteInfo[fileName]
+
+		if txt {
+			if txtMD.BlockHashList[0] == "0" {
+				txt = false
+			}
+		}
+
+		if remote {
+			if remoteMD.BlockHashList[0] == "0" {
+				remote = false
+			}
+		}
+
+		var real_txt bool
+		//determine if local and index is the same
+		if (real) && (txt) {
+			real_txt = true
+			for i, h := range txtMD.BlockHashList {
+				if h != rHash[i] {
+					real_txt = false
+				}
+			}
+		} else if (real) || (txt) {
+			real_txt = false
+		} else {
+			real_txt = true
+		}
+
+		var txt_remote bool
+		//determine if index and remote is the same
+		if (remote) && (txt) {
+			txt_remote = true
+			for i, h := range txtMD.BlockHashList {
+				if h != remoteMD.BlockHashList[i] {
+					txt_remote = false
+				}
+			}
+		} else if (remote) || (txt) {
+			txt_remote = false
+		} else {
+			txt_remote = true
+		}
+
+		//remote are not the same
+		if !txt_remote {
+			//if remote has the file then download
+			if remote {
+				if err := download(&client, fileName, remoteMD); err != nil {
+					log.Println("Cannot download remote file: ", e)
+				}
+			} else if real { // if remote deleted and basedir still has it, then delete the file from basedir
+				os.Remove(ConcatPath(client.BaseDir, fileName))
+			}
+			fileInfoMap[fileName] = remoteMD
+
+		} else if !real_txt { // local cahnge, server same
+			fileMeta := new(FileMetaData)
+			fileMeta.Filename = fileName
+
+			if remote {
+				fileMeta.Version = remoteMD.Version + 1
+			} else {
+				fileMeta.Version = 1
+			}
+
+			//if deleted in basedir
+			if !real {
+				fileMeta.BlockHashList = make([]string, 0)
+				fileMeta.BlockHashList = append(fileMeta.BlockHashList, "0")
+			} else {
+				fileMeta.BlockHashList = make([]string, len(rHash))
+
+				if (!txt && !remote) || (!real_txt) {
+
+					// PutBlock to remote
+					if err := upload(&client, fileName); err != nil {
+						log.Println("Cannot upload file here: ", err)
+					}
+					// Update the hashlist to be the actual hashlist
+					copy(fileMeta.BlockHashList, rHash)
+				}
+			}
+
+			var rVersion int32
+			var err error
+			if rVersion, err = updateFileInfo(&client, fileMeta); err != nil {
+				log.Println(err)
+			}
+
+			if rVersion == -1 {
+				// Race Condition
+				var newFileInfos map[string]*FileMetaData
+				if err := client.GetFileInfoMap(&newFileInfos); err != nil {
+					log.Println("Cannot get file info map: ", err)
+				}
+
+				if (len(newFileInfos[fileName].BlockHashList) == 1) && (newFileInfos[fileName].BlockHashList[0] == "0") {
+					os.Remove(ConcatPath(client.BaseDir, fileName))
+				} else {
+					// Sync download new remote block
+					if err := download(&client, fileName, newFileInfos[fileName]); err != nil {
+						log.Println("Cannot download file: ", err)
+					}
+				}
+
+				fileMeta = newFileInfos[fileName]
+
+			}
+			fileInfoMap[fileName] = fileMeta
 		}
 	}
-	var blk *BlockHashes = new(BlockHashes)
-	blk.state = blockHashesIn.state
-	blk.sizeCache = blockHashesIn.sizeCache
-	blk.unknownFields = blockHashesIn.unknownFields
-	blk.Hashes = block_slice
-	return blk, nil
+
+	if err := WriteMetaFile(fileInfoMap, client.BaseDir); err != nil {
+		log.Println("Cannot write Meta file: ", err)
+	}
 }
 
-// This line guarantees all method for BlockStore are implemented
-var _ BlockStoreInterface = new(BlockStore)
+func upload(client *RPCClient, fileName string) error {
 
-func NewBlockStore() *BlockStore {
-	return &BlockStore{
-		BlockMap: map[string]*Block{},
+	var rHash []string
+	if err := client.HasBlocks(realHash[fileName], bsAddr, &rHash); err != nil {
+		log.Panicln("base addr: ", bsAddr)
+		log.Fatal("Cannot has block ", err)
 	}
+	len := len(rHash)
+
+	for i, hash := range realHash[fileName] {
+		// block not in remote
+		if i >= len || (hash != rHash[i]) {
+			var succ Success
+			if err := client.PutBlock(realData[hash], bsAddr, &succ.Flag); err != nil {
+				log.Println("cannot upload block")
+			}
+		}
+	}
+
+	return nil
+}
+
+func updateFileInfo(client *RPCClient, fileMeta *FileMetaData) (int32, error) {
+	var latestVersion int32
+	if err := client.UpdateFile(fileMeta, &latestVersion); err != nil {
+		log.Println("cannot update file info")
+	}
+	return latestVersion, nil
+}
+
+func download(client *RPCClient, fileName string, fileMetaData *FileMetaData) error {
+	addr := client.BaseDir + "/" + fileName
+	_, e := os.Stat(addr)
+	if os.IsNotExist(e) { //if not exist, then create a file
+		os.Create(addr)
+	} else { //else clean the file and download
+		os.Truncate(addr, 0)
+	}
+
+	file, _ := os.OpenFile(addr, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0666)
+	defer file.Close()
+
+	for _, hash := range fileMetaData.BlockHashList {
+		var block Block
+		if e := client.GetBlock(hash, client.MetaStoreAddrs[0], &block); e != nil {
+			log.Println("Cannot get block: \n", e)
+		}
+		file.Write(block.BlockData)
+	}
+	return nil
 }
