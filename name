@@ -2,71 +2,65 @@ package surfstore
 
 import (
 	context "context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
-	"sync"
-
-	emptypb "google.golang.org/protobuf/types/known/emptypb"
+	sync "sync"
 )
 
-type MetaStore struct {
-	FileMetaMap    map[string]*FileMetaData
-	BlockStoreAddr string
-	UnimplementedMetaStoreServer
+type BlockStore struct {
+	BlockMap map[string]*Block
+	UnimplementedBlockStoreServer
 	mu sync.Mutex
 }
 
-func (m *MetaStore) GetFileInfoMap(ctx context.Context, _ *emptypb.Empty) (*FileInfoMap, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	var serverFileInfoMap *FileInfoMap = new(FileInfoMap)
-	serverFileInfoMap.FileInfoMap = m.FileMetaMap
-	return serverFileInfoMap, nil
+func (bs *BlockStore) GetBlock(ctx context.Context, blockHash *BlockHash) (*Block, error) {
+	bs.mu.Lock()
+	defer bs.mu.Unlock()
+	val, ok := bs.BlockMap[blockHash.Hash]
+	if ok {
+		return val, nil
+	}
+	return nil, fmt.Errorf("invalid Key: %s", blockHash.Hash)
 }
 
-func (m *MetaStore) UpdateFile(ctx context.Context, fileMetaData *FileMetaData) (*Version, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+func (bs *BlockStore) PutBlock(ctx context.Context, block *Block) (*Success, error) {
+	bs.mu.Lock()
+	defer bs.mu.Unlock()
+	hash := sha256.New()
+	hash.Write(block.BlockData)
+	hashBytes := hash.Sum(nil)
+	hashCode := hex.EncodeToString(hashBytes)
+	bs.BlockMap[hashCode] = block
+	return &Success{Flag: true}, nil
+}
 
-	old, exist := m.FileMetaMap[fileMetaData.Filename]
+// Given a list of hashes “in”, returns a list containing the
+// subset of in that are stored in the key-value store
+func (bs *BlockStore) HasBlocks(ctx context.Context, blockHashesIn *BlockHashes) (*BlockHashes, error) {
+	bs.mu.Lock()
+	defer bs.mu.Unlock()
+	block_slice := make([]string, 0)
 
-	if !exist {
-		m.FileMetaMap[fileMetaData.Filename] = fileMetaData
-		m.FileMetaMap[fileMetaData.Filename].Version = 1
-		return &Version{
-			Version: 1,
-		}, nil
-	}
-
-	if old.Version+1 == fileMetaData.Version {
-		m.FileMetaMap[fileMetaData.Filename] = fileMetaData
-	} else {
-		err := fmt.Errorf("wrong Version:%d, Lastest Version:%d",
-			fileMetaData.Version, old.Version)
-		ver0 := Version{
-			Version: -1,
+	for _, blockHash := range blockHashesIn.Hashes {
+		_, ok := bs.BlockMap[blockHash]
+		if ok {
+			block_slice = append(block_slice, blockHash)
 		}
-		return &ver0, err
 	}
-	ver := Version{
-		Version: fileMetaData.Version,
-	}
-	return &ver, nil
+	var blk *BlockHashes = new(BlockHashes)
+	blk.state = blockHashesIn.state
+	blk.sizeCache = blockHashesIn.sizeCache
+	blk.unknownFields = blockHashesIn.unknownFields
+	blk.Hashes = block_slice
+	return blk, nil
 }
 
-func (m *MetaStore) GetBlockStoreAddr(ctx context.Context, _ *emptypb.Empty) (*BlockStoreAddr, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+// This line guarantees all method for BlockStore are implemented
+var _ BlockStoreInterface = new(BlockStore)
 
-	return &BlockStoreAddr{Addr: m.BlockStoreAddr}, nil
-}
-
-// This line guarantees all method for MetaStore are implemented
-var _ MetaStoreInterface = new(MetaStore)
-
-func NewMetaStore(blockStoreAddr string) *MetaStore {
-	return &MetaStore{
-		FileMetaMap:    map[string]*FileMetaData{},
-		BlockStoreAddr: blockStoreAddr,
+func NewBlockStore() *BlockStore {
+	return &BlockStore{
+		BlockMap: map[string]*Block{},
 	}
 }
